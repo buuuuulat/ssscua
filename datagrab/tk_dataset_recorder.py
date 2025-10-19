@@ -26,6 +26,11 @@ from typing import Optional, Dict, Any, List
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+from llm_task_writer import TaskWriter
+
+
+WRITER = TaskWriter()
+
 # -------- задачи --------
 @dataclass
 class Task:
@@ -47,12 +52,12 @@ class LocalListTaskProvider(TaskProvider):
 
 # -------- GUI --------
 class App(tk.Tk):
-    def __init__(self, provider: TaskProvider):
+    def __init__(self):  # provider убираем
         super().__init__()
         self.title("Dataset Recorder")
         self.geometry("540x360"); self.minsize(500, 330)
 
-        self.provider = provider
+        # self.provider = provider  # <-- больше не нужно
         self.current_task: Optional[Task] = None
         self.rec_proc: Optional[subprocess.Popen] = None
         self.recording = False
@@ -128,10 +133,33 @@ class App(tk.Tk):
             self.bind_all("<Command-period>", lambda e: self.on_finish())
 
     # ---- задачи ----
+    # ---- задачи ----
     def _fetch_and_show_next_task(self):
-        self.current_task = self.provider.get_next_task()
-        self._set_task_text(self.current_task.text if self.current_task else "Задачи закончились. Спасибо!")
-        self.btn_start.state(["!disabled"] if self.current_task else ["disabled"])
+        # плейсхолдер, чтобы UI не завис
+        self._set_task_text("Генерирую задание…")
+        self.btn_start.state(["disabled"])
+
+        def worker():
+            task = None
+            try:
+                text = WRITER.new_task()  # ← вот он единственный вызов
+                text = (str(text).strip() if text is not None else "")
+                if text:
+                    task = Task(task_id=f"llm_{int(time.time())}", text=text)
+            except Exception as e:
+                print(f"[App] new_task() error: {e}")
+            self.after(0, lambda: self._apply_task(task))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_task(self, task: Optional[Task]):
+        self.current_task = task
+        if task:
+            self._set_task_text(task.text)
+            self.btn_start.state(["!disabled"])
+        else:
+            self._set_task_text("Задачи нет или произошла ошибка генерации.")
+            self.btn_start.state(["disabled"])
 
     def _set_task_text(self, text: str):
         self.task_text.configure(state=tk.NORMAL); self.task_text.delete("1.0", tk.END)
@@ -316,36 +344,43 @@ class App(tk.Tk):
 
     # ---- завершение ----
     def _on_recorder_stopped(self, returncode: Optional[int], rec_id: str):
-        try: self.deiconify(); self.lift(); self.focus_force()
-        except Exception: pass
+        try:
+            self.deiconify();
+            self.lift();
+            self.focus_force()
+        except Exception:
+            pass
 
         self.recording = False
         if self._timer_job is not None:
-            try: self.after_cancel(self._timer_job)
-            except Exception: pass
+            try:
+                self.after_cancel(self._timer_job)
+            except Exception:
+                pass
             self._timer_job = None
-        self.timer_var.set("00:00"); self.btn_finish.state(["disabled"])
+        self.timer_var.set("00:00")
+        self.btn_finish.state(["disabled"])
 
         if returncode not in (None, 0, -2):
             if returncode == -5:
                 messagebox.showerror("Нет прав (macOS)",
-                    "SIGTRAP: вероятно, нет прав Screen Recording/Input Monitoring/Accessibility.\n"
-                    "System Settings → Privacy & Security → добавьте Terminal/PyCharm и перезапустите их.")
+                                     "SIGTRAP: вероятно, нет прав Screen Recording/Input Monitoring/Accessibility.\n"
+                                     "System Settings → Privacy & Security → добавьте Terminal/PyCharm и перезапустите их.")
             else:
                 messagebox.showerror("Ошибка записи", f"Дочерний процесс завершился с кодом: {returncode}")
 
-        # submit
+        # submit (пока ничего не отправляем)
         try:
             rec_dir = self.dataset_root_dir / rec_id
             meta_path = rec_dir / "meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-            if self.current_task: self.provider.submit_result(self.current_task.task_id, rec_id, meta)
-        except Exception: pass
+            # если захочешь, здесь можно вызвать WRITER.on_submit(...), если он есть
+        except Exception:
+            pass
 
-        self._fetch_and_show_next_task()
-        self.status_var.set("Готово")
-        self.btn_start.state(["!disabled"] if self.current_task else ["disabled"])
         self.rec_proc = None
+        self.status_var.set("Готово")
+        self._fetch_and_show_next_task()  # _apply_task сам включит кнопку "Начать запись"
 
     # ---- поиск рекордера ----
     def _find_recorder_binary(self) -> Optional[Path]:
@@ -418,6 +453,7 @@ class App(tk.Tk):
             self._size_job = None
         self.destroy()
 
+
 def make_provider_from_env() -> TaskProvider:
     tasks_json = os.environ.get("TASKS_JSON","").strip()
     if tasks_json and Path(tasks_json).exists():
@@ -429,7 +465,84 @@ def make_provider_from_env() -> TaskProvider:
         "Откройте почту и подготовьте черновик письма другу",
     ])
 
-if __name__ == "__main__":
-    app = App(make_provider_from_env()); app.mainloop()
 
-# ToDo add LLM support
+# -------- задачи из файла --------
+class FileTaskProvider(TaskProvider):
+    """
+    Берёт ОДНО задание из ./task.txt (весь файл как одна строка задания).
+    После показа считает задачу отданной и больше не возвращает.
+    """
+    def __init__(self, path: str | Path = "./task.txt", encoding: str = "utf-8"):
+        self.path = Path(path)
+        self.encoding = encoding
+        self._served = False
+
+    def get_next_task(self) -> Optional[Task]:
+        if self._served:
+            return None
+        try:
+            if not self.path.exists():
+                print(f"[FileTaskProvider] Файл не найден: {self.path.resolve()}")
+                return None
+            text = self.path.read_text(encoding=self.encoding).strip()
+            if not text:
+                print(f"[FileTaskProvider] Файл пуст: {self.path.resolve()}")
+                return None
+            self._served = True
+            return Task(task_id=f"file:{self.path.resolve()}", text=text)
+        except Exception as e:
+            print(f"[FileTaskProvider] Ошибка чтения: {e}")
+            return None
+
+    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None:
+        # тут ничего не делаем — локальный файл
+        return
+
+
+# -------- LLM-задачи (через TaskWriter.new_task) --------
+class LLMTaskProvider(TaskProvider):
+    """
+    На каждый запрос задачи вызывает llm_task_writer.TaskWriter.new_task()
+    и возвращает её текст как Task.
+    """
+    def __init__(self, writer=None, **writer_kwargs):
+        # Импортируем лениво, чтобы не падать, если файла нет
+        try:
+            if writer is None:
+                from llm_task_writer import TaskWriter  # файл рядом
+                writer = TaskWriter(**writer_kwargs)
+        except Exception as e:
+            raise RuntimeError(f"[LLMTaskProvider] Не удалось импортировать/инициализировать TaskWriter: {e}")
+        self.writer = writer
+        self._counter = 0
+
+    def get_next_task(self) -> Optional[Task]:
+        try:
+            text = self.writer.new_task()
+            if text is None:
+                return None
+            text = str(text).strip()
+            if not text:
+                return None
+            self._counter += 1
+            return Task(task_id=f"llm_{self._counter}", text=text)
+        except Exception as e:
+            print(f"[LLMTaskProvider] Ошибка при new_task(): {e}")
+            return None
+
+    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None:
+        # Если у TaskWriter есть хук — вызовем. Иначе молча пропустим.
+        try:
+            if hasattr(self.writer, "on_submit"):
+                # допускаем разные сигнатуры
+                try:
+                    self.writer.on_submit(task_id=task_id, rec_id=rec_id, meta=meta)
+                except TypeError:
+                    self.writer.on_submit(task_id, rec_id, meta)
+        except Exception as e:
+            print(f"[LLMTaskProvider] on_submit() ошибка: {e}")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
