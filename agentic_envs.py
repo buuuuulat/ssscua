@@ -5,11 +5,15 @@ from gymnasium.spaces import Dict, Box, Discrete
 from mss import mss
 from typing import Optional
 
+from executor import MacExecutor
+
+
 
 class ComputerUseEnv(gym.Env):
-    def __init__(self, new_size=(1280, 720), verbose=False, monitor_index=1, fps=20, obs_prev_n_actions=10,
-                 n_actions=19):
+    def __init__(self, new_size=(1280, 720), verbose=False, monitor_index=1, fps=20, obs_prev_n_actions=10):
         super().__init__()
+        self.executor = MacExecutor()
+
         self.verbose = verbose
 
         self.monitor_index = monitor_index
@@ -24,8 +28,10 @@ class ComputerUseEnv(gym.Env):
         self.observation_space = Box(low=0, high=255, shape=(3, new_size[0], new_size[1]), dtype=np.uint8)
         self.action_space = Dict({
             "move_mouse": Box(low=np.array([0, 0]), high=np.array(new_size)),
-            "use_action": Discrete(n_actions)
+            "use_action": Discrete(self.executor.n_discrete)
         })
+
+        self.reset()
 
     def _print_info(self, action):
         if self.verbose:
@@ -47,9 +53,10 @@ class ComputerUseEnv(gym.Env):
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
+        self.executor.release_all()
         observation = self._get_obs()
         info = {}
         return observation, info
 
-    def steo(self):
+    def step(self, action):
         pass
